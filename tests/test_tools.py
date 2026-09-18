@@ -1,7 +1,10 @@
+import json
+import time
+
 import pytest
 
 from agent_harness.domain import (
-    ApprovalRequired, CallConflictError, RiskLevel, UnsafeRetryError,
+    ApprovalRequired, CallConflictError, LeaseLostError, RiskLevel, UnsafeRetryError,
 )
 from agent_harness.store import SQLiteStore
 from agent_harness.tools import ToolGateway, ToolRegistry, ToolSpec
@@ -99,3 +102,65 @@ def test_non_idempotent_failure_becomes_uncertain_and_is_not_retried(tmp_path):
     with pytest.raises(UnsafeRetryError):
         gateway.execute(**kwargs)
     assert len(effects) == 1
+
+
+def test_late_worker_cannot_clobber_the_result_of_the_new_lease_holder(tmp_path):
+    """A slow handler that outlives its lease must not overwrite the new owner."""
+    store = SQLiteStore(tmp_path / "state.db")
+    workflow_id = store.create_workflow("lease handover")
+    registry = ToolRegistry()
+    calls: list[int] = []
+    winner: dict[str, object] = {}
+
+    def handler(args):
+        calls.append(1)
+        if len(calls) == 1:
+            time.sleep(0.05)  # the first worker's 0.01s lease expires here
+            winner["result"] = ToolGateway(
+                store, registry, worker_id="worker-b"
+            ).execute(**kwargs)
+            return {"invocation": 1}
+        return {"invocation": 2}
+
+    registry.register(ToolSpec("tool", "test tool", RiskLevel.IDEMPOTENT_WRITE, handler=handler))
+    kwargs = dict(session_id=store.session_id(workflow_id), workflow_id=workflow_id,
+                  task_id="task", tool_name="tool", arguments={"x": 1},
+                  purpose="test", call_id="handover")
+    gateway_a = ToolGateway(store, registry, worker_id="worker-a", lease_seconds=0.01)
+
+    assert gateway_a.execute(**kwargs) == {"invocation": 2}
+    assert winner["result"] == {"invocation": 2}
+    with store.transaction() as conn:
+        row = conn.execute("SELECT status, result_json FROM tool_calls WHERE call_id='handover'").fetchone()
+    assert row["status"] == "succeeded"
+    assert json.loads(row["result_json"]) == {"invocation": 2}
+    events = [e["event_type"] for e in store.recent_events(workflow_id, 50)]
+    assert "tool.lease_lost" in events
+
+
+def test_lost_lease_on_non_idempotent_call_is_surfaced_not_overwritten(tmp_path):
+    store = SQLiteStore(tmp_path / "state.db")
+    workflow_id = store.create_workflow("non-idempotent handover")
+    registry = ToolRegistry()
+
+    def handler(args):
+        # An operator reconciled the call elsewhere while we were still running.
+        with store.transaction(immediate=True) as conn:
+            conn.execute("UPDATE tool_calls SET lease_owner='operator' WHERE call_id='send'")
+        return {"sent": True}
+
+    registry.register(ToolSpec("tool", "test tool", RiskLevel.NON_IDEMPOTENT_WRITE, handler=handler))
+    gateway = ToolGateway(store, registry, worker_id="worker-a")
+    kwargs = dict(session_id=store.session_id(workflow_id), workflow_id=workflow_id,
+                  task_id="task", tool_name="tool", arguments={"text": "hi"},
+                  purpose="notify", call_id="send")
+
+    with pytest.raises(ApprovalRequired) as caught:
+        gateway.execute(**kwargs)
+    store.decide_approval(caught.value.approval_id, True, "reviewer")
+
+    with pytest.raises(LeaseLostError):
+        gateway.execute(**kwargs)
+    with store.transaction() as conn:
+        row = conn.execute("SELECT status FROM tool_calls WHERE call_id='send'").fetchone()
+    assert row["status"] == "running"  # untouched by the worker that lost the lease

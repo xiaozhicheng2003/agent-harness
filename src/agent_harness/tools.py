@@ -10,7 +10,8 @@ from typing import Any, Callable, Protocol
 from jsonschema import validate as validate_json_schema
 
 from .domain import (
-    ApprovalRequired, CallConflictError, RiskLevel, ToolCallStatus, UnsafeRetryError,
+    ApprovalRequired, CallConflictError, LeaseLostError, RiskLevel, ToolCallStatus,
+    UnsafeRetryError,
 )
 from .store import SQLiteStore, dumps, utc_now
 
@@ -155,8 +156,7 @@ class ToolGateway:
         except Exception as exc:
             self._record_failure(call_id, workflow_id, task_id, spec.risk, str(exc))
             raise
-        self._record_success(call_id, workflow_id, task_id, result)
-        return result
+        return self._record_success(call_id, workflow_id, task_id, spec, result)
 
     def _authorize_or_request(
         self, spec: ToolSpec, session_id: str, workflow_id: str, task_id: str,
@@ -250,14 +250,46 @@ class ToolGateway:
             )
         return "execute", None
 
-    def _record_success(self, call_id: str, workflow_id: str, task_id: str, result: Any) -> None:
+    def _record_success(
+        self, call_id: str, workflow_id: str, task_id: str, spec: ToolSpec, result: Any,
+    ) -> Any:
         with self.store.transaction(immediate=True) as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """UPDATE tool_calls SET status=?, result_json=?, lease_owner=NULL,
-                   lease_until=NULL, updated_at=? WHERE call_id=?""",
-                (ToolCallStatus.SUCCEEDED, dumps(result), utc_now(), call_id),
+                   lease_until=NULL, updated_at=?
+                   WHERE call_id=? AND lease_owner=?""",
+                (ToolCallStatus.SUCCEEDED, dumps(result), utc_now(), call_id, self.worker_id),
             )
-            self.store._append_event(conn, workflow_id, task_id, "tool.succeeded", {"call_id": call_id})
+            if cursor.rowcount:
+                self.store._append_event(
+                    conn, workflow_id, task_id, "tool.succeeded", {"call_id": call_id}
+                )
+                return result
+
+            # The lease expired while the handler was still running and another
+            # worker took the call over, so a blind UPDATE would clobber whatever
+            # that worker already persisted.
+            stored = conn.execute(
+                "SELECT status, result_json FROM tool_calls WHERE call_id=?", (call_id,)
+            ).fetchone()
+            recorded_status = stored["status"] if stored else None
+            self.store._append_event(conn, workflow_id, task_id, "tool.lease_lost", {
+                "call_id": call_id, "risk": spec.risk,
+                "recorded_status": recorded_status, "discarded_result": result,
+            })
+            if (
+                spec.risk != RiskLevel.NON_IDEMPOTENT_WRITE
+                and recorded_status == ToolCallStatus.SUCCEEDED
+                and stored["result_json"] is not None
+            ):
+                # Read-only and idempotent calls are safe to duplicate, so the
+                # worker that won the lease owns the authoritative result.
+                return json.loads(stored["result_json"])
+        # Non-idempotent outcomes cannot be reconciled automatically: surface it.
+        raise LeaseLostError(
+            f"lease for {call_id} was taken over during execution; "
+            f"recorded status is {recorded_status}"
+        )
 
     def _record_failure(
         self, call_id: str, workflow_id: str, task_id: str, risk: RiskLevel, error: str,
@@ -270,13 +302,20 @@ class ToolGateway:
             else ToolCallStatus.FAILED
         )
         with self.store.transaction(immediate=True) as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """UPDATE tool_calls SET status=?, error=?, lease_owner=NULL,
-                   lease_until=NULL, updated_at=? WHERE call_id=?""",
-                (status, error, utc_now(), call_id),
+                   lease_until=NULL, updated_at=?
+                   WHERE call_id=? AND lease_owner=?""",
+                (status, error, utc_now(), call_id, self.worker_id),
             )
-            self.store._append_event(
-                conn, workflow_id, task_id,
-                "tool.uncertain" if status == ToolCallStatus.UNCERTAIN else "tool.failed",
-                {"call_id": call_id, "error": error},
-            )
+            event_type = "tool.uncertain" if status == ToolCallStatus.UNCERTAIN else "tool.failed"
+            if cursor.rowcount:
+                self.store._append_event(
+                    conn, workflow_id, task_id, event_type, {"call_id": call_id, "error": error},
+                )
+                return
+            # Not our lease any more: the new owner's record of this call stands,
+            # and our failure is preserved in the audit trail instead of overwriting it.
+            self.store._append_event(conn, workflow_id, task_id, "tool.lease_lost", {
+                "call_id": call_id, "risk": risk, "discarded_error": error,
+            })

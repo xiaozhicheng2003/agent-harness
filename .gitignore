@@ -8,3 +8,11 @@ htmlcov/
 artifacts/
 .env
 
+# LangGraph checkpointer files (e.g. demo.db.checkpoints) are runtime state
+*.db.checkpoints
+*.db-wal
+*.db-shm
+
+# Local-only change notes
+local-changes/
+

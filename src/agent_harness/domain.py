@@ -96,5 +96,9 @@ class UnsafeRetryError(HarnessError):
     pass
 
 
+class LeaseLostError(HarnessError):
+    """A worker finished a side effect after losing the lease that owned it."""
+
+
 class CallConflictError(HarnessError):
     pass

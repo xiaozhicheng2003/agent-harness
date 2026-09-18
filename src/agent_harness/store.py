@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -25,31 +25,41 @@ class SQLiteStore:
 
     def __init__(self, path: str | Path = "harness.db") -> None:
         self.path = str(path)
-        self._local = threading.local()
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a connection that is always closed on exit.
+
+        ``sqlite3.Connection`` doubles as a transaction context manager, so
+        ``with sqlite3.connect(...) as conn`` commits but never closes. Using it
+        as a connection scope leaks one file descriptor per call, which exhausts
+        the default ``ulimit -n`` after a few hundred reads.
+        """
         conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
-
-    @contextmanager
-    def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
-        conn = self._connect()
         try:
-            conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            conn.execute("PRAGMA foreign_keys=ON")
             yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
         finally:
             conn.close()
 
+    @contextmanager
+    def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        with self._connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     def _initialize(self) -> None:
         with self._connect() as conn:
+            # WAL is a persistent database property; setting it on every
+            # connection would needlessly take a write lock per connect.
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS workflows (
@@ -73,6 +83,8 @@ class SQLiteStore:
                     error TEXT,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     max_attempts INTEGER NOT NULL DEFAULT 2,
+                    lease_owner TEXT,
+                    lease_until REAL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -158,6 +170,23 @@ class SQLiteStore:
                 );
                 """
             )
+            self._migrate(conn)
+
+    @staticmethod
+    def _add_missing_columns(
+        conn: sqlite3.Connection, table: str, columns: dict[str, str],
+    ) -> None:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Additive migrations so databases from an earlier version keep working."""
+        self._add_missing_columns(conn, "tasks", {
+            "lease_owner": "TEXT",
+            "lease_until": "REAL",
+        })
 
     def create_workflow(self, goal: str, *, workflow_id: str | None = None) -> str:
         workflow_id = workflow_id or f"wf_{uuid.uuid4().hex[:12]}"
@@ -235,17 +264,56 @@ class SQLiteStore:
             if task.status == TaskStatus.PENDING and set(task.depends_on).issubset(succeeded)
         ]
 
-    def start_task(self, task_id: str) -> bool:
+    def start_task(
+        self,
+        task_id: str,
+        *,
+        worker_id: str | None = None,
+        lease_seconds: float = 300.0,
+    ) -> bool:
+        """Atomically claim a pending task under a lease.
+
+        The lease is what makes a crash recoverable: a task left ``running`` by a
+        process that died is reclaimed by :meth:`reclaim_expired_tasks` instead of
+        blocking the workflow forever.
+        """
         with self.transaction(immediate=True) as conn:
             cursor = conn.execute(
-                """UPDATE tasks SET status=?, attempts=attempts+1, updated_at=?
+                """UPDATE tasks SET status=?, attempts=attempts+1, lease_owner=?,
+                   lease_until=?, updated_at=?
                    WHERE id=? AND status=?""",
-                (TaskStatus.RUNNING, utc_now(), task_id, TaskStatus.PENDING),
+                (TaskStatus.RUNNING, worker_id, time.time() + lease_seconds, utc_now(),
+                 task_id, TaskStatus.PENDING),
             )
             if cursor.rowcount:
                 row = conn.execute("SELECT workflow_id FROM tasks WHERE id=?", (task_id,)).fetchone()
-                self._append_event(conn, row[0], task_id, "task.started", {})
+                self._append_event(conn, row[0], task_id, "task.started", {"worker_id": worker_id})
             return bool(cursor.rowcount)
+
+    def reclaim_expired_tasks(self, workflow_id: str, *, now: float | None = None) -> list[str]:
+        """Return tasks abandoned by a dead worker to the pending pool.
+
+        Re-running a reclaimed task is safe because the tool ledger replays calls
+        that already succeeded and refuses to blindly retry non-idempotent ones.
+        """
+        deadline = time.time() if now is None else now
+        with self.transaction(immediate=True) as conn:
+            rows = conn.execute(
+                """SELECT id, lease_owner FROM tasks
+                   WHERE workflow_id=? AND status=?
+                     AND (lease_until IS NULL OR lease_until <= ?)""",
+                (workflow_id, TaskStatus.RUNNING, deadline),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """UPDATE tasks SET status=?, lease_owner=NULL, lease_until=NULL, updated_at=?
+                       WHERE id=?""",
+                    (TaskStatus.PENDING, utc_now(), row["id"]),
+                )
+                self._append_event(conn, workflow_id, row["id"], "task.reclaimed", {
+                    "previous_owner": row["lease_owner"],
+                })
+            return [row["id"] for row in rows]
 
     def finish_task(self, task_id: str, output: dict[str, Any]) -> None:
         with self.transaction(immediate=True) as conn:
@@ -260,22 +328,26 @@ class SQLiteStore:
                     return
                 raise ValueError(f"task {task_id} already succeeded with different output")
             conn.execute(
-                "UPDATE tasks SET status=?, output_json=?, error=NULL, updated_at=? WHERE id=?",
+                """UPDATE tasks SET status=?, output_json=?, error=NULL, lease_owner=NULL,
+                   lease_until=NULL, updated_at=? WHERE id=?""",
                 (TaskStatus.SUCCEEDED, encoded, utc_now(), task_id),
             )
             self._append_event(conn, row["workflow_id"], task_id, "task.succeeded", {"output": output})
 
     def fail_task(self, task_id: str, error: str, *, retryable: bool) -> None:
-        with self.transaction() as conn:
+        with self.transaction(immediate=True) as conn:
             row = conn.execute(
                 "SELECT workflow_id, attempts, max_attempts FROM tasks WHERE id=?", (task_id,)
             ).fetchone()
-            status = TaskStatus.PENDING if retryable and row[1] < row[2] else TaskStatus.FAILED
+            if row is None:
+                raise KeyError(task_id)
+            status = TaskStatus.PENDING if retryable and row["attempts"] < row["max_attempts"] else TaskStatus.FAILED
             conn.execute(
-                "UPDATE tasks SET status=?, error=?, updated_at=? WHERE id=?",
+                """UPDATE tasks SET status=?, error=?, lease_owner=NULL, lease_until=NULL,
+                   updated_at=? WHERE id=?""",
                 (status, error, utc_now(), task_id),
             )
-            self._append_event(conn, row[0], task_id, "task.failed", {"error": error, "retryable": retryable})
+            self._append_event(conn, row["workflow_id"], task_id, "task.failed", {"error": error, "retryable": retryable})
 
     def wait_task_for_approval(self, task_id: str) -> None:
         with self.transaction(immediate=True) as conn:
@@ -285,21 +357,27 @@ class SQLiteStore:
             if row["status"] == TaskStatus.WAITING_APPROVAL:
                 return
             conn.execute(
-                "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+                """UPDATE tasks SET status=?, lease_owner=NULL, lease_until=NULL, updated_at=?
+                   WHERE id=?""",
                 (TaskStatus.WAITING_APPROVAL, utc_now(), task_id),
             )
             self._append_event(conn, row["workflow_id"], task_id, "task.waiting_approval", {})
 
     def resume_approved_tasks(self, workflow_id: str) -> int:
-        with self.transaction() as conn:
+        with self.transaction(immediate=True) as conn:
             cursor = conn.execute(
-                """UPDATE tasks SET status=?, updated_at=?
+                """UPDATE tasks SET status=?, lease_owner=NULL, lease_until=NULL, updated_at=?
                    WHERE workflow_id=? AND status=? AND NOT EXISTS (
                      SELECT 1 FROM approvals a
                      WHERE a.task_id=tasks.id AND a.status!='approved'
                    )""",
                 (TaskStatus.PENDING, utc_now(), workflow_id, TaskStatus.WAITING_APPROVAL),
             )
+            if cursor.rowcount:
+                self._append_event(
+                    conn, workflow_id, None, "task.resumed_after_approval",
+                    {"count": cursor.rowcount},
+                )
             return cursor.rowcount
 
     def add_artifact(self, workflow_id: str, task_id: str, artifact: dict[str, Any]) -> str:
